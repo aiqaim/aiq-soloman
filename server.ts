@@ -1,19 +1,87 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import db from "./src/db.ts";
 import { GoogleGenAI } from "@google/genai";
 import "dotenv/config";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Constants for models
+const CHAT_MODEL = "gemini-2.5-flash";
+const IMAGE_MODEL = "gemini-2.5-flash";
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  // Security headers - Relaxed for AI Studio iframe compatibility
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+        "img-src": ["'self'", "data:", "https://picsum.photos", "https://placehold.co", "https://*.googleusercontent.com"],
+        "connect-src": ["'self'", "https://*.run.app", "ws://*.run.app", "https://generativelanguage.googleapis.com", "https://*.googleapis.com"],
+        "script-src": ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        "frame-ancestors": ["'self'", "https://*.google.com", "https://*.run.app"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    crossOriginOpenerPolicy: false,
+  }));
+
+  // Rate limiting to prevent abuse
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    limit: 100, // Limit each IP to 100 requests per windowMs
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: "SoloMan is a bit tired! Please wait a few minutes before asking again. 😴" }
+  });
+
+  app.use("/api/", limiter);
+  app.use(express.json({ limit: '10mb' }));
+
+  // Request logging
+  app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    next();
+  });
+
+  // Load licenses
+  let validKeys = new Set<string>();
+  try {
+    const licensesPath = path.join(__dirname, 'src', 'licenses.json');
+    console.log(`Loading licenses from: ${licensesPath}`);
+    if (fs.existsSync(licensesPath)) {
+      const licenseData = JSON.parse(fs.readFileSync(licensesPath, 'utf8'));
+      validKeys = new Set(licenseData.keys);
+      console.log(`Loaded ${validKeys.size} valid license keys`);
+    } else {
+      console.error(`Licenses file not found at ${licensesPath}`);
+    }
+  } catch (err) {
+    console.error("Failed to load licenses:", err);
+  }
+
+  // The gatekeeper middleware
+  app.use(['/api/chat', '/api/chat/*'], (req, res, next) => {
+    const userKeyHeader = req.headers['x-license-key'];
+    const userKey = Array.isArray(userKeyHeader) ? userKeyHeader[0] : userKeyHeader;
+
+    if (!userKey || !validKeys.has(userKey)) {
+      return res.status(403).json({ 
+        error: "SoloMan is sleeping! Please provide a valid license key to wake him up." 
+      });
+    }
+    next(); // Key is valid, proceed to Gemini 3 Flash
+  });
 
   // Health check
   app.get("/api/health", (req, res) => {
@@ -33,7 +101,7 @@ async function startServer() {
       if (tasks.length === 0) {
         const initialMissions = [
           { title: "Say hi to SoloMan in Chat! 👋", description: "Start your first conversation." },
-          { title: "Ask for a picture of a Dragon! 🐉", description: "Use 'show me' in chat." },
+          { title: "Ask for an avatar of a Dragon! 🐉", description: "Use 'show me' in chat." },
           { title: "Complete your first mission! 🏆", description: "Click the circle to finish." }
         ];
         for (const m of initialMissions) {
@@ -92,7 +160,7 @@ async function startServer() {
       let history = db.prepare("SELECT role, content FROM chat_history ORDER BY timestamp ASC").all();
       
       if (history.length === 0) {
-        const welcome = "Hi there! I'm SoloMan, your AI best friend! 🚀 I'm here to help you with your missions and show you cool pictures. What's your name?";
+        const welcome = "Hi there! I'm SoloMan, your AI best friend! 🚀 I'm here to help you with your missions and show you cool avatars. What's your name?";
         db.prepare("INSERT INTO chat_history (role, content) VALUES (?, ?)").run('model', welcome);
         history = [{ role: 'model', content: welcome }];
       }
@@ -101,6 +169,18 @@ async function startServer() {
     } catch (err) {
       console.error("Database Error (chat):", err);
       res.status(500).json({ error: "Failed to fetch chat history" });
+    }
+  });
+
+  app.post("/api/chat/save", (req, res) => {
+    try {
+      const { role, content } = req.body;
+      if (!role || !content) return res.status(400).json({ error: "Missing role or content" });
+      db.prepare("INSERT INTO chat_history (role, content) VALUES (?, ?)").run(role, content);
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Database Error (save chat):", err);
+      res.status(500).json({ error: "Failed to save chat message" });
     }
   });
 
@@ -115,66 +195,17 @@ async function startServer() {
     }
   });
 
-  app.post("/api/chat", async (req, res) => {
-    const { message } = req.body;
-    
-    if (!process.env.GEMINI_API_KEY) {
-      console.error("GEMINI_API_KEY is missing from environment");
-      return res.status(500).json({ error: "AI configuration error" });
-    }
-
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const model = "gemini-3-flash-preview";
-    
-    // Save user message
-    db.prepare("INSERT INTO chat_history (role, content) VALUES (?, ?)").run('user', message);
-
+  // Gallery Routes
+  app.post("/api/gallery/upload", (req, res) => {
     try {
-      // Get history for context - limit to last 6 messages to keep it focused
-      const history = db.prepare("SELECT role, content FROM chat_history ORDER BY timestamp DESC LIMIT 6").all().reverse();
-      
-      const contents = history.map(h => ({
-        role: h.role === 'user' ? 'user' : 'model',
-        parts: [{ text: h.content }]
-      }));
-
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          systemInstruction: "You are SoloMan, a super friendly, enthusiastic, and loveable AI mentor for kids aged 6-15! You live in a high-tech quantum portal. Your goal is to be their best friend, encourage their curiosity, and help them with missions. If they ask for a picture, describe it with wonder and excitement. Use lots of emojis! Keep your answers short, fun, and very positive. Never be mean or boring!",
-          temperature: 0.9,
-          topP: 0.95,
-        }
-      });
-
-      const aiResponse = response.text?.trim();
-      
-      if (!aiResponse) {
-        console.error("Gemini returned empty text:", response);
-        throw new Error("Empty response from AI");
-      }
-      
-      // Save AI response
-      db.prepare("INSERT INTO chat_history (role, content) VALUES (?, ?)").run('model', aiResponse);
-
-      res.json({ response: aiResponse });
-    } catch (error) {
-      console.error("Gemini Error:", error);
-      const fallback = "Oops! My super-brain had a little hiccup. 🧠 Can you say that again? I'm ready to help!";
-      res.json({ response: fallback });
-    }
-  });
-
-  app.post("/api/gallery/upload", express.json({ limit: '10mb' }), (req, res) => {
-    try {
-      const { imageUrl } = req.body;
-      console.log("Uploading image to gallery...");
-      db.prepare("INSERT INTO gallery (type, url) VALUES (?, ?)").run('uploaded', imageUrl);
+      const { imageUrl, prompt, type } = req.body;
+      if (!imageUrl) return res.status(400).json({ error: "Missing imageUrl" });
+      console.log("Saving image to gallery...");
+      db.prepare("INSERT INTO gallery (type, url, prompt) VALUES (?, ?, ?)").run(type || 'uploaded', imageUrl, prompt || null);
       res.json({ success: true });
     } catch (err) {
       console.error("Database Error (upload):", err);
-      res.status(500).json({ error: "Failed to upload image" });
+      res.status(500).json({ error: "Failed to save image" });
     }
   });
 
@@ -199,100 +230,6 @@ async function startServer() {
       res.status(500).json({ error: "Failed to delete image" });
     }
   });
-  app.post("/api/edit-image", async (req, res) => {
-    const { prompt, base64Image } = req.body;
-    
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: "AI configuration error" });
-    }
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      // Extract the base64 data and mime type
-      const matches = base64Image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-      if (!matches || matches.length !== 3) {
-        return res.status(400).json({ error: "Invalid image format" });
-      }
-      const mimeType = matches[1];
-      const data = matches[2];
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                data,
-                mimeType,
-              },
-            },
-            {
-              text: `Apply this edit to the image: ${prompt}. Keep it fun and kid-friendly!`,
-            },
-          ],
-        },
-      });
-
-      let imageUrl = null;
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          imageUrl = `data:image/png;base64,${part.inlineData.data}`;
-          break;
-        }
-      }
-
-      if (imageUrl) {
-        // Save to gallery
-        db.prepare("INSERT INTO gallery (type, url, prompt) VALUES (?, ?, ?)").run('generated', imageUrl, `Edit: ${prompt}`);
-        res.json({ imageUrl });
-      } else {
-        res.status(500).json({ error: "Failed to edit image" });
-      }
-    } catch (error) {
-      console.error("Image Editing Error:", error);
-      res.status(500).json({ error: "Failed to edit image" });
-    }
-  });
-
-  app.post("/api/generate-image", async (req, res) => {
-    const { prompt } = req.body;
-    
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: "AI configuration error" });
-    }
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [{ text: `A vibrant, high-quality, futuristic and kid-friendly 3D illustration of: ${prompt}. The style should be modern, colorful, and full of energy, similar to a high-end animated movie. No text in the image.` }]
-        }
-      });
-
-      let imageUrl = null;
-      if (response.candidates?.[0]?.content?.parts) {
-        for (const part of response.candidates[0].content.parts) {
-          if (part.inlineData) {
-            imageUrl = `data:image/png;base64,${part.inlineData.data}`;
-            break;
-          }
-        }
-      }
-
-      if (imageUrl) {
-        // Save to gallery
-        db.prepare("INSERT INTO gallery (type, url, prompt) VALUES (?, ?, ?)").run('generated', imageUrl, prompt);
-        res.json({ imageUrl });
-      } else {
-        res.status(500).json({ error: "Failed to generate image" });
-      }
-    } catch (error) {
-      console.error("Image Generation Error:", error);
-      res.status(500).json({ error: "Failed to generate image" });
-    }
-  });
   console.log(`Starting server in ${process.env.NODE_ENV || 'development'} mode`);
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -309,6 +246,15 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  // Global Error Handler
+  app.use((err: any, req: any, res: any, next: any) => {
+    console.error("Unhandled Server Error:", err);
+    res.status(err.status || 500).json({ 
+      error: "SoloMan's brain had a hiccup! 🧠",
+      details: err.message || "Unknown error"
+    });
   });
 }
 

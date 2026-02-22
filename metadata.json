@@ -1,5 +1,5 @@
 {
-  "name": "AiQ-SoloMan",
+  "name": "AiQ-SoloMan-Lite",
   "description": "A high-performance full-stack application powered by AI, Express, and SQLite.",
   "requestFramePermissions": [
     "camera",
